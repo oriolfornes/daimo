@@ -35,7 +35,7 @@ Options:
 - `-d, --debugging`: use only the first 1,000 sequences of each file.
 - `-w, --widths`: the widths to try, as a list in the style of `cut -f` (`8,10,12`, `5-19`, `5-8,12,15-`); default: the width of the seed (see [Motif width](#motif-width)).
 - `-m, --motif`: which motif to use when a MEME file has several, by name or by ID (e.g. `MA1419.1`). Not needed for single-motif files. MEME matrices are probabilities, so 1e-4 is added and the columns renormalized before taking the log, as DAMO does for the PFMs it builds.
-- `--scale`: with `--oformat jaspar` or `meme`, a factor applied to the PWM before converting it to frequencies (default 0.1). See below.
+- `--scale`: with `--oformat jaspar` or `meme`, the factor applied to the PWM before converting it to frequencies: `auto` (default), which fits it to the sequences, or a positive number. See below.
 
 The `AUC optimized from ... to ...` line is printed to stdout too, so use `-o` to keep the motif on its own.
 
@@ -53,9 +53,17 @@ The input format is detected from the file. The output format is set with `--ofo
 - `jaspar`: frequencies (not counts) as a JASPAR matrix.
 - `meme`: frequencies as a MEME file, laid out as ExplaiNN-2 writes it (`nsites` is a placeholder).
 
-For `jaspar` and `meme` the PWM weights are scaled (`--scale`, default 0.1), read as energies in kT and converted with a Boltzmann distribution (a softmax over A, C, G and T at each position), as in DiMO. The motif keeps the name of the seed: the JASPAR ID and name, or the MEME `MOTIF` line.
+For `jaspar` and `meme` the PWM weights are scaled (`--scale`), read as energies in kT and converted with a Boltzmann distribution (a softmax over A, C, G and T at each position), as in DiMO. The motif keeps the name of the seed: the JASPAR ID and name, or the MEME `MOTIF` line.
 
-The optimized weights are large (about -290 to +32 on the IRF4 example), so the conversion at scale 1, DiMO's unscaled one, gives nearly one-hot columns, and a rounded file no longer ranks the three non-top bases. A scale of 0.1 keeps that ranking and still shows the strong positions as strong. It is a pragmatic default: the right value depends on the spread of the weights, and information content is only comparable between motifs written with the same scale. Above 1 sharpens the columns and below 1 flattens them. The `pwm` format is not affected by the scale.
+daimo optimizes the PWM so that it ranks positives above negatives, and a ranking does not change when every weight is multiplied by the same number. So the size of the weights is arbitrary, and it keeps growing while daimo runs: at a fixed scale, the sharpness of the frequency matrix depends on the number of iterations. On the IRF4 example, the motif written at scale 0.1 has 4.9, 10.4, 14.3 and 16.9 bits after 25, 50, 75 and 100 iterations, while the AUC stays at 0.72.
+
+By default (`--scale auto`) the scale is therefore fitted to the sequences: daimo takes the scale at which the frequency matrix best describes the positive sequences as a probability model (maximum likelihood; each sequence has no site or one, on either strand, and the rest follows the base composition of the negatives). On the same four checkpoints the fitted motif has 7.5, 7.7, 7.8 and 7.8 bits. The fit uses the sequences daimo was run on (at most 10,000 positives, a fixed sample beyond that), takes a few seconds, and the fitted scale and the fraction of sequences with a site are reported on stderr after the motif is written.
+
+![The IRF4 example at the fitted scale and at three fixed scales, and the likelihood of the positive sequences as a function of the scale](docs/scale.png)
+
+The figure shows what the scale does on the IRF4 example (first 1,000 sequences of each file, `-d`). The optimized PWM is the same in the four daimo logos (**a**): only the scale changes, and the motif goes from 7.7 bits at the fitted scale (0.036) to 28.5 bits, nearly one-hot, at scale 1. The fitted scale is the one at which the motif best explains the positive sequences (**b**); the sharper motifs at 0.1, 0.3 and 1 explain them worse, because real sites do not match the consensus that closely.
+
+`--scale` with a number uses that scale instead: above 1 sharpens the columns and below 1 flattens them. `--scale 0.1` gives the output of daimo 1.0.1, where it was the default. `--scale 1` is DiMO's unscaled conversion, which gives nearly one-hot columns because the optimized weights are large (about -290 to +32 on the IRF4 example). Information content is only comparable between motifs written with the fitted scale, or with the same number after the same number of iterations. The `pwm` format is not affected by the scale.
 
 ## Motif width
 
@@ -85,7 +93,7 @@ pwm = damo("positive_seqs.fa.gz", "negative_seqs.fa.gz", "motif.jaspar", iterati
 pwm = damo("positive_seqs.fa.gz", "negative_seqs.fa.gz", "motif.jaspar", widths="5-19")
 ```
 
-`pwm` is a NumPy array of shape (4, motif length), the log PWM with rows A, C, G and T. `widths` is a string like `cut -f` or a list of ints. `daimo.damo.pwm_to_pfm(pwm, scale)` converts a PWM to frequencies.
+`pwm` is a NumPy array of shape (4, motif length), the log PWM with rows A, C, G and T. `widths` is a string like `cut -f` or a list of ints. `daimo.damo.pwm_to_pfm(pwm, scale)` converts a PWM to frequencies, and `daimo.damo.fit_scale(pwm, positive_seqs, negative_seqs)` fits that scale to sequences given as strings (what `--scale auto` does).
 
 ## How daimo differs from DiMO and DAMO
 
@@ -94,7 +102,7 @@ daimo implements DiMO's optimization on a mononucleotide PWM (which is also leve
 - **No dinucleotide terms.** DAMO can add adjacent-dinucleotide interactions (`-i` in DAMO.py). daimo has only the PWM.
 - **You set the widths to explore; there is no flexible width search.** DiMO's width optimization (section 2.6 of the [paper](https://pubmed.ncbi.nlm.nih.gov/24369152/)) pads the motif to about 20 columns, cuts it to the central 6 and restores columns one at a time while each adds at least 0.3% AUC on held-out sequences. DAMO.py's command line has no width option. daimo does neither: you give the list of widths (`--widths 5-19`), each one is optimized, and the best held-out AUC wins. On the IRF4 example, the DiMO-style procedure picked 8 columns and lost held-out AUC (0.668, against 0.712 at the seed width), because the signal is spread over many columns and it stops at the first column that does not pay.
 - **PyTorch, and the GPU.** The PWM is a one-filter convolution followed by a max pool, so all sequences are scored in one batch on CUDA or Apple's MPS, or on the CPU. DAMO.py is Python 2.7 with NumPy, SciPy and scikit-learn.
-- **Inputs and outputs.** Seeds are JASPAR matrices or MEME files (detected from the content, gzipped or not), where DAMO.py reads its own PFM text format. The output is the log PWM, or frequencies as JASPAR or MEME with the scale described above. DiMO converts its PWM to a PFM without scaling (section 2.7 of the paper), which is `--scale 1`.
+- **Inputs and outputs.** Seeds are JASPAR matrices or MEME files (detected from the content, gzipped or not), where DAMO.py reads its own PFM text format. The output is the log PWM, or frequencies as JASPAR or MEME with the scale described above (fitted to the sequences by default). DiMO converts its PWM to a PFM without scaling (section 2.7 of the paper), which is `--scale 1`.
 - **Same update, same learning rates.** The update uses the overlap zone between the first negative and the last positive, with learning rates 1, 0.55 and 0.1, and stops when none improves the AUC. The default of 500 iterations follows DAMO.py (the paper's default is 150 epochs).
 - **Seed pseudocounts.** The seed PWM gets Biopython's JASPAR pseudocounts, not DAMO's.
 - **Sequences.** All sequences in an input file must have the same length. Windows that overlap an `N` are scored with the `N` as zeros, not skipped.
