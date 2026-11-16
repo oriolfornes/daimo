@@ -5,9 +5,9 @@ import sys
 import click
 
 from daimo.damo import (DEFAULT_SCALE, _parse_width_ranges,
-                        damo, pwm_to_pfm)
-from daimo.io import (open_file, read_motif, write_jaspar, write_meme,
-                       write_pwm)
+                        damo, fit_scale, pwm_to_pfm)
+from daimo.io import (open_file, read_motif, read_sequences, write_jaspar,
+                       write_meme, write_pwm)
 
 CONTEXT_SETTINGS = {
     "help_option_names": ["-h", "--help"],
@@ -23,6 +23,48 @@ def _check_widths(value):
             raise click.BadParameter(str(e)) from None
 
     return value
+
+
+class Scale(click.ParamType):
+    """A positive number, or "auto" (any case)."""
+
+    name = "number|auto"
+
+    def convert(self, value, param, ctx):
+        if isinstance(value, str) and value.strip().lower() == "auto":
+            return "auto"
+        try:
+            scale = float(value)
+        except (TypeError, ValueError):
+            scale = None
+        if scale is None or not 0 < scale < float("inf"):
+            self.fail(f"{value!r} is not a positive number or 'auto'",
+                      param, ctx)
+
+        return scale
+
+
+def _fit_scale(pwm, positive_seqs_file, negative_seqs_file, debugging):
+    """
+    Fit the scale of the PWM to the sequences that `damo` was run on.
+
+    Returns:
+        Tuple (scale, report): the fitted scale and a line that reports it.
+    """
+    positives, negatives = (
+        [str(record.seq) for record in read_sequences(file, debugging)]
+        for file in (positive_seqs_file, negative_seqs_file))
+    scale, details = fit_scale(pwm, positives, negatives, return_details=True)
+    if details["sequences"] == 0:
+        return scale, (f"Scale: {scale:g} (the PWM is flat, so there is "
+                       "nothing to fit).")
+    report = (f"Fitted scale: {scale:.4g} (fraction of sequences with a "
+              f"site: {details['fraction_with_site']:.2f}).")
+    if details["at_edge"]:
+        report += (" Warning: the fit ended at the edge of its search "
+                   "interval, so this scale may not be the best one.")
+
+    return scale, report
 
 
 @click.command(no_args_is_help=True, context_settings=CONTEXT_SETTINGS)
@@ -80,10 +122,11 @@ def _check_widths(value):
     "--scale",
     help="With --oformat jaspar or meme: factor applied to the PWM before "
          "converting it to frequencies; above 1 sharpens the columns, "
-         "below 1 flattens them. 0.1 keeps the ranking of sites "
-         "through the rounding of the output file; 1 is DiMO's unscaled "
-         "conversion and gives nearly one-hot columns.",
-    type=click.FloatRange(min=0, min_open=True),
+         "below 1 flattens them. auto fits it to the positive sequences, "
+         "so the sharpness of the motif does not depend on the size of the "
+         "weights; 0.1 gives the output of daimo 1.0.1; 1 is DiMO's "
+         "unscaled conversion and gives nearly one-hot columns.",
+    type=Scale(),
     default=DEFAULT_SCALE,
     show_default=True,
 )
@@ -94,7 +137,8 @@ def main(**args):
     by default, with one line per position and four columns (A, C, G, T).
     With --oformat jaspar or meme it is a motif of frequencies instead: the
     PWM weights are read as energies (kT) and converted with a Boltzmann
-    distribution, as in DiMO, after scaling them by 0.1 (see --scale).
+    distribution, as in DiMO, after scaling them. By default the scale is
+    fitted to the positive sequences (see --scale).
     """
     ctx = click.get_current_context()
     scale_given = (ctx.get_parameter_source("scale")
@@ -108,12 +152,17 @@ def main(**args):
         iterations=args["iterations"], motif_name=args["motif"],
         widths=args["widths"])
 
+    fit_report = None
     if args["oformat"] == "pwm":
         def write(handle):
             write_pwm(pwm, handle)
     else:
         name, _ = read_motif(args["seed_motif"], args["motif"])
-        pfm = pwm_to_pfm(pwm, args["scale"])
+        scale = args["scale"]
+        if scale == "auto":
+            scale, fit_report = _fit_scale(pwm, args["positive_seqs"],
+                args["negative_seqs"], args["debugging"])
+        pfm = pwm_to_pfm(pwm, scale)
         writer = write_jaspar if args["oformat"] == "jaspar" else write_meme
 
         def write(handle):
@@ -121,6 +170,11 @@ def main(**args):
 
     if args["output_file"] is None:
         write(sys.stdout)
+        sys.stdout.flush()
     else:
         with open_file(args["output_file"], "w") as handle:
             write(handle)
+
+    # After the motif, and on stderr, so that it stays out of the motif
+    if fit_report is not None:
+        click.echo(fit_report, err=True)

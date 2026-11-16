@@ -19,7 +19,7 @@ from daimo import cli
 from daimo.io import read_pwm
 from daimo.damo import (_compute_auc, _generate_pwm, _get_pwm_model,
                          _score_sequences, _update_pwm, damo, pwm_to_pfm)
-from daimo.damo import _choose_width, _resize, _split, parse_widths
+from daimo.damo import _choose_width, _resize, _split, fit_scale, parse_widths
 from daimo.io import read_sequences
 from daimo.sequence import dna_one_hot, dna_one_hot_many
 
@@ -108,19 +108,52 @@ def test_oformat_defaults_to_the_log_pwm(monkeypatch, tmp_path):
     np.testing.assert_allclose(np.loadtxt(out).T, pwm, atol=1e-8)
 
 
-def test_frequency_formats_default_to_scale_0_1(monkeypatch, tmp_path):
-    pwm = np.log(np.array([[.7, .1], [.1, .2], [.1, .3], [.1, .4]])) * 20
+def _written(path):
+    written = np.exp(read_pwm(str(path)))
+    return written / written.sum(axis=0)
+
+
+def test_frequency_formats_default_to_the_fitted_scale(monkeypatch, tmp_path):
+    pwm = read_pwm(JASPAR) * 20
+    fa = os.path.join(ROOT, "examples", "positive_seqs.fa.gz")
+    sequences = [str(r.seq) for r in read_sequences(fa, True)]
+    scale = fit_scale(pwm, sequences, sequences)
+    assert not np.isclose(scale, .1, rtol=.2)
     out = tmp_path / "motif.meme"
-    assert _run(monkeypatch, tmp_path, ["--oformat", "meme", "-o", str(out)], pwm).exit_code == 0
-    written = np.exp(read_pwm(str(out)))
-    written /= written.sum(axis=0)
-    np.testing.assert_allclose(written, pwm_to_pfm(pwm, .1), atol=5e-4)
+    res = _run(monkeypatch, tmp_path, ["-d", "--oformat", "meme", "-o", str(out)], pwm)
+    assert res.exit_code == 0, res.output
+    np.testing.assert_allclose(_written(out), pwm_to_pfm(pwm, scale), atol=5e-4)
+    assert f"Fitted scale: {scale:.4g}" in res.output
+    # --scale auto is the default, in any case
+    for auto in ("auto", "AUTO"):
+        out_auto = tmp_path / f"motif.{auto}.meme"
+        res = _run(monkeypatch, tmp_path, ["-d", "--oformat", "meme", "--scale", auto,
+                                           "-o", str(out_auto)], pwm)
+        assert res.exit_code == 0, res.output
+        assert out_auto.read_text() == out.read_text()
+    # --scale 0.1 gives the output of 1.0.1, and fits nothing
+    out01 = tmp_path / "motif01.meme"
+    res = _run(monkeypatch, tmp_path, ["--oformat", "meme", "--scale", "0.1", "-o", str(out01)], pwm)
+    assert res.exit_code == 0 and "Fitted scale" not in res.output
+    np.testing.assert_allclose(_written(out01), pwm_to_pfm(pwm, .1), atol=5e-4)
     # an explicit scale of 1 still gives DiMO's unscaled conversion
     out1 = tmp_path / "motif1.meme"
     assert _run(monkeypatch, tmp_path, ["--oformat", "meme", "--scale", "1", "-o", str(out1)], pwm).exit_code == 0
-    unscaled = np.exp(read_pwm(str(out1)))
-    unscaled /= unscaled.sum(axis=0)
-    np.testing.assert_allclose(unscaled, pwm_to_pfm(pwm, 1.), atol=5e-4)
+    np.testing.assert_allclose(_written(out1), pwm_to_pfm(pwm, 1.), atol=5e-4)
+
+
+def test_fitted_scale_is_reported_after_the_motif(monkeypatch, tmp_path):
+    pwm = np.log(np.array([[.7, .1], [.1, .2], [.1, .3], [.1, .4]]))
+    res = _run(monkeypatch, tmp_path, ["-d", "--oformat", "meme"], pwm)
+    assert res.exit_code == 0, res.output
+    assert res.output.startswith("MEME version 4")
+    assert res.output.rstrip().splitlines()[-1].startswith("Fitted scale: ")
+
+
+def test_scale_rejects_what_is_not_a_positive_number_or_auto(monkeypatch, tmp_path):
+    for bad in ("banana", "0", "-1", "nan", "inf"):
+        res = _run(monkeypatch, tmp_path, ["--oformat", "meme", f"--scale={bad}"])
+        assert res.exit_code == 2 and "auto" in res.output, bad
 
 
 def test_oformat_writes_to_stdout(monkeypatch, tmp_path):
@@ -129,8 +162,9 @@ def test_oformat_writes_to_stdout(monkeypatch, tmp_path):
 
 
 def test_scale_needs_a_frequency_format(monkeypatch, tmp_path):
-    res = _run(monkeypatch, tmp_path, ["--scale", "2", "-o", str(tmp_path / "o.txt")])
-    assert res.exit_code != 0 and "--oformat" in res.output
+    for scale in ("2", "auto"):
+        res = _run(monkeypatch, tmp_path, ["--scale", scale, "-o", str(tmp_path / "o.txt")])
+        assert res.exit_code == 2 and "--oformat" in res.output
 
 
 def test_meme_input_name_is_kept_in_the_output(monkeypatch, tmp_path):
@@ -366,3 +400,83 @@ def test_widths_string_reaches_the_search(tmp_path, capsys):
     for k in (5, 6, 7, 15):
         assert f"width {k:>3}:" in out
     assert "width   8" not in out and pwm.shape[1] in (5, 6, 7, 15)
+
+
+def _planted(seed=1714, width=10, n=3000, length=100, with_site=.7, conc=.25):
+    """Random sequences; a fraction of the positives has a site drawn from a PFM."""
+    rng = np.random.default_rng(seed)
+    prng = random.Random(seed)
+    rand = lambda: "".join(prng.choice("ACGT") for _ in range(length))  # noqa: E731
+    pfm = rng.dirichlet(np.full(4, conc), width).T             # columns of mixed sharpness
+    pfm = (pfm + .01) / (pfm + .01).sum(0)
+    pos, neg = [], []
+    for _ in range(n):
+        s = rand()
+        neg.append(rand())
+        if prng.random() < with_site:
+            site = "".join("ACGT"[rng.choice(4, p=pfm[:, j])] for j in range(width))
+            if prng.random() < .5:
+                site = str(Seq(site).reverse_complement())
+            i = prng.randrange(0, length - width + 1)
+            s = s[:i] + site + s[i + width:]
+        pos.append(s)
+    return pfm, pos, neg
+
+
+@pytest.fixture(scope="module")
+def planted():
+    return _planted()
+
+
+def test_fit_scale_undoes_the_size_of_the_weights(planted):
+    pfm, pos, neg = planted
+    rng = np.random.default_rng(1714)
+    products = []
+    for size in (.1, 1., 10., 37.):
+        # arbitrary size, arbitrary constant per column
+        pwm = size * np.log(pfm) + rng.normal(0, 3, (1, pfm.shape[1]))
+        scale, details = fit_scale(pwm, pos, neg, return_details=True)
+        products.append(scale * size)
+        # the fitted matrix is the matrix the sites were drawn from
+        assert np.abs(pwm_to_pfm(pwm, scale) - pfm).max() < .05
+        assert abs(details["fraction_with_site"] - .7) < .08
+        assert not details["at_edge"]
+    products = np.array(products)
+    assert np.all(np.abs(products - 1) < .15)
+    # same answer whatever the size of the weights
+    assert products.max() / products.min() < 1.02
+
+
+def test_fit_scale_with_fewer_sites():
+    pfm, pos, neg = _planted(seed=7, with_site=.3)
+    scale, details = fit_scale(np.log(pfm) * 5, pos, neg, return_details=True)
+    assert abs(scale * 5 - 1) < .2
+    assert abs(details["fraction_with_site"] - .3) < .08
+
+
+def test_fit_scale_skips_n_and_short_sequences(planted):
+    pfm, pos, _ = planted
+    # variable lengths, N, a sequence shorter than the motif, no negatives
+    mixed = pos[:500] + ["ACGT", "N" * 50, pos[0][:40] + "NNN" + pos[0][40:]]
+    scale, details = fit_scale(np.log(pfm), mixed, return_details=True)
+    assert np.isfinite(scale) and scale > 0
+    assert details["sequences"] == 501                         # not ACGT, not the Ns
+    with pytest.raises(ValueError, match="as long as the motif"):
+        fit_scale(np.log(pfm), ["ACGT"])
+    with pytest.raises(ValueError, match="real bases"):
+        fit_scale(np.log(pfm), ["N" * 50], ["ACGT"])
+
+
+def test_fit_scale_of_a_flat_pwm_is_1(planted):
+    _, pos, neg = planted
+    # uniform at every scale: no fit, no error
+    assert fit_scale(np.zeros((4, 6)), pos[:10]) == 1.
+    assert fit_scale(np.full((4, 6), -1.386), pos[:10], neg[:10]) == 1.
+
+
+def test_fit_scale_samples_beyond_max_sequences(planted):
+    pfm, pos, neg = planted
+    capped = fit_scale(np.log(pfm), pos, neg, max_sequences=1000)
+    everything = fit_scale(np.log(pfm), pos, neg, max_sequences=None)
+    assert abs(capped / everything - 1) < .1
+    assert capped == fit_scale(np.log(pfm), pos, neg, max_sequences=1000)   # seeded

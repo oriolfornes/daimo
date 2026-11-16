@@ -28,11 +28,24 @@ WIDTH_TOLERANCE = 0.002
 VALIDATION_FRACTION = 0.2
 
 # Scale applied to the PWM before it is written as frequencies. The optimized
-# weights are large (about -290 to +32 on the IRF4 example), so at 1 (DiMO's
-# unscaled conversion) the columns are nearly one-hot, and a rounded output file
-# loses the ranking of the non-top bases. 0.1 keeps it; the right value depends
-# on the spread of the weights.
-DEFAULT_SCALE = 0.1
+# PWM only has to rank positives above negatives, and a ranking does not change
+# when every weight is multiplied by the same number: the size of the weights is
+# arbitrary, and it keeps growing while daimo runs. So no fixed scale is right.
+# "auto" fits it to the sequences (see fit_scale). A number is used as it is:
+# 0.1 was the default up to 1.0.1, and 1 is DiMO's unscaled conversion.
+DEFAULT_SCALE = "auto"
+
+# fit_scale. The search interval is in units of "nats between the best and the
+# worst base of an average column": 0.05 is flat, 60 is one-hot. Dividing by the
+# average column range of the PWM makes the search independent of the size of
+# the weights.
+BASES = "ACGT"
+SPREAD_RANGE = (0.05, 60.0)
+GRID_POINTS = 60
+MAX_SEQUENCES = 10000      # the fit does not need more: a seeded sample is used beyond this
+SEED = 1714
+GOLDEN = (np.sqrt(5) - 1) / 2
+
 LEARNING_RATES = [1.0, 0.55, 0.1]
 
 
@@ -386,6 +399,173 @@ def pwm_to_pfm(pwm, scale=1.0):
     z = np.exp(scaled - scaled.max(axis=0, keepdims=True))
 
     return z / z.sum(axis=0, keepdims=True)
+
+
+def _one_hot(sequences):
+    """
+    One-hot encode sequences of any length for fit_scale.
+
+    Returns:
+        Tensor of shape (n, 4, longest), float32; N and padding are all-zero
+        columns.
+    """
+    lut = np.full(256, 4, dtype=np.int64)
+    for i, b in enumerate(BASES):
+        lut[ord(b)] = i
+    width = max(len(s) for s in sequences)
+    idx = np.full((len(sequences), width), 4, dtype=np.int64)
+    for i, s in enumerate(sequences):
+        idx[i, :len(s)] = lut[np.frombuffer(s.upper().encode(), dtype=np.uint8)]
+
+    return torch.from_numpy(
+        np.eye(5, dtype=np.float32)[idx][:, :, :4].transpose(0, 2, 1).copy())
+
+
+def _composition(sequences):
+    """Strand-symmetric base frequencies (A, C, G, T), with a count of 1 added."""
+    counts = _one_hot(sequences).sum((0, 2)).numpy().astype(float) + 1.0
+    counts = counts + counts[::-1]
+
+    return counts / counts.sum()
+
+
+def _golden_max(fun, lo, hi, iterations=40):
+    """Maximum of a unimodal function on [lo, hi]; returns (argmax, max)."""
+    a, b = lo, hi
+    c, d = b - GOLDEN * (b - a), a + GOLDEN * (b - a)
+    fc, fd = fun(c), fun(d)
+    for _ in range(iterations):
+        if fc > fd:
+            b, d, fd = d, c, fc
+            c = b - GOLDEN * (b - a)
+            fc = fun(c)
+        else:
+            a, c, fc = c, d, fd
+            d = a + GOLDEN * (b - a)
+            fd = fun(d)
+
+    return (a + b) / 2, max(fc, fd)
+
+
+def fit_scale(pwm, positive_seqs, negative_seqs=None,
+              max_sequences=MAX_SEQUENCES, seed=SEED, batch_size=4096,
+              return_details=False):
+    """
+    Scale at which softmax(scale * pwm) best describes the positive sequences.
+
+    The scaled PWM is read as a probability model of the sites: each positive
+    sequence has no site or one, at any position of either strand, and the
+    rest of it follows the background. The scale and the fraction of
+    sequences with a site are fitted together by maximum likelihood. A
+    constant added to a column changes nothing, and neither does the size of
+    the weights: the search interval is set from their spread.
+
+    Only windows made of real bases count (N and padding are skipped), and
+    sequences shorter than the motif are dropped.
+
+    Args:
+        pwm: Log PWM of shape (4, motif length), rows A, C, G and T (what
+            `damo` returns).
+        positive_seqs: Sequences (strings) that the motif should explain.
+            Scanned on both strands.
+        negative_seqs: Sequences whose strand-symmetric base composition is
+            the background. None: the positives' own composition.
+        max_sequences: Fit on at most this many positives (a random sample
+            with `seed`); None for all.
+        seed: Random seed of that sample.
+        batch_size: Sequences scanned at a time.
+        return_details: Also return a dict: fraction_with_site,
+            log_likelihood, at_edge (the fit ended at the edge of its search
+            interval), sequences (the number used) and spread.
+
+    Returns:
+        The scale (float), 1.0 for a flat PWM, which is uniform at every
+        scale. Use it as `pwm_to_pfm(pwm, scale)`.
+    """
+    pwm = np.asarray(pwm, dtype=np.float64)
+    width = pwm.shape[1]
+
+    # A constant per column changes nothing
+    weights = pwm - pwm.mean(axis=0, keepdims=True)
+    spread = float((weights.max(axis=0) - weights.min(axis=0)).mean())
+    if not np.all(np.isfinite(weights)):
+        raise ValueError("the PWM has values that are not finite")
+
+    # A flat PWM is uniform at every scale
+    if spread <= 0:
+        if return_details:
+            return 1.0, dict(fraction_with_site=float("nan"),
+                             log_likelihood=0.0, at_edge=False, sequences=0,
+                             spread=0.0)
+        return 1.0
+
+    log_bg = np.log(_composition(
+        negative_seqs if negative_seqs is not None else positive_seqs))
+
+    usable = [s for s in positive_seqs if len(s) >= width]
+    if max_sequences is not None and len(usable) > max_sequences:
+        picks = np.sort(np.random.default_rng(seed).choice(
+            len(usable), max_sequences, replace=False))
+        usable = [usable[i] for i in picks]
+    if not usable:
+        raise ValueError("no positive sequence is as long as the motif")
+
+    # Scan with four filters: the motif, its reverse complement, the
+    # background, and the number of real bases in the window
+    x = _one_hot(usable)
+    kernels = torch.from_numpy(np.stack([
+        weights, weights[::-1, ::-1].copy(),
+        np.repeat(log_bg[:, None], width, 1),
+        np.ones((4, width))]).astype(np.float32))
+    out = torch.cat([torch.nn.functional.conv1d(x[i:i + batch_size], kernels)
+                     for i in range(0, len(x), batch_size)]).double().numpy()
+
+    # Windows without N or padding
+    valid = out[:, 3] > width - 0.5
+    keep = valid.any(axis=1)
+    raw, bg, valid = out[keep, :2], out[keep, 2], valid[keep]   # raw: (n, 2, positions)
+    n_windows = 2 * valid.sum(axis=1)
+    if len(raw) == 0:
+        raise ValueError("no positive sequence has a window of real bases as "
+                         "long as the motif")
+
+    def site_log_odds(scale):
+        """Per sequence: log of the mean, over its windows and strands, of
+        P(window | motif) / P(window | background)."""
+        log_z = np.log(np.exp(scale * weights).sum(axis=0)).sum()
+        a = np.where(valid[:, None, :], scale * raw - log_z - bg[:, None, :],
+                     -np.inf).reshape(len(raw), -1)
+        top = a.max(axis=1, keepdims=True)
+
+        return (top + np.log(np.exp(a - top).sum(axis=1, keepdims=True)))[:, 0] \
+            - np.log(n_windows)
+
+    def log_likelihood(scale):
+        """Best (logit of the fraction of sequences with a site, log-likelihood)."""
+        m = site_log_odds(scale)
+
+        return _golden_max(
+            lambda t: np.logaddexp(-np.logaddexp(0, t),
+                                   -np.logaddexp(0, -t) + m).sum(),
+            -12.0, 12.0)
+
+    # A grid first, then a finer search around its best point
+    grid = np.geomspace(*SPREAD_RANGE, GRID_POINTS) / spread
+    values = np.array([log_likelihood(s)[1] for s in grid])
+    best = int(values.argmax())
+    at_edge = best in (0, len(grid) - 1)
+    lo = np.log(grid[max(best - 1, 0)])
+    hi = np.log(grid[min(best + 1, len(grid) - 1)])
+    log_scale, ll = _golden_max(
+        lambda t: log_likelihood(float(np.exp(t)))[1], lo, hi, iterations=20)
+    scale = float(np.exp(log_scale))
+    if not return_details:
+        return scale
+    logit, _ = log_likelihood(scale)
+
+    return scale, dict(fraction_with_site=float(1 / (1 + np.exp(-logit))),
+                       log_likelihood=float(ll), at_edge=bool(at_edge),
+                       sequences=int(len(raw)), spread=spread)
 
 
 def _get_pwm_model(pwm, sequence_length, device="cpu"):
