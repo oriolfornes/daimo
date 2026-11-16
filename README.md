@@ -59,6 +59,10 @@ daimo optimizes the PWM so that it ranks positives above negatives, and a rankin
 
 By default (`--scale auto`) the scale is therefore fitted to the sequences: daimo takes the scale at which the frequency matrix best describes the positive sequences as a probability model (maximum likelihood; each sequence has no site or one, on either strand, and the rest follows the base composition of the negatives). On the same four checkpoints the fitted motif has 7.5, 7.7, 7.8 and 7.8 bits. The fit uses the sequences daimo was run on (at most 10,000 positives, a fixed sample beyond that), takes a few seconds, and the fitted scale and the fraction of sequences with a site are reported on stderr after the motif is written.
 
+![The IRF4 example at the fitted scale and at three fixed scales, and the likelihood of the positive sequences as a function of the scale](docs/scale.png)
+
+The figure shows what the scale does on the IRF4 example (first 1,000 sequences of each file, `-d`). The optimized PWM is the same in the four daimo logos (**a**): only the scale changes, and the motif goes from 7.7 bits at the fitted scale (0.036) to 28.5 bits, nearly one-hot, at scale 1. The fitted scale is the one at which the motif best explains the positive sequences (**b**); the sharper motifs at 0.1, 0.3 and 1 explain them worse, because real sites do not match the consensus that closely.
+
 `--scale` with a number uses that scale instead: above 1 sharpens the columns and below 1 flattens them. `--scale 0.1` gives the output of daimo 1.0.1, where it was the default. `--scale 1` is DiMO's unscaled conversion, which gives nearly one-hot columns because the optimized weights are large (about -290 to +32 on the IRF4 example). Information content is only comparable between motifs written with the fitted scale, or with the same number after the same number of iterations. The `pwm` format is not affected by the scale.
 
 ## Motif width
