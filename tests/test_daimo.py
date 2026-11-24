@@ -20,6 +20,7 @@ from daimo.io import read_pwm
 from daimo.damo import (_compute_auc, _generate_pwm, _get_pwm_model,
                          _score_sequences, _update_pwm, damo, pwm_to_pfm)
 from daimo.damo import _choose_width, _resize, _split, fit_scale, parse_widths
+from daimo.damo import NothingToMatch, match_scale
 from daimo.io import read_sequences
 from daimo.sequence import dna_one_hot, dna_one_hot_many
 
@@ -153,7 +154,7 @@ def test_fitted_scale_is_reported_after_the_motif(monkeypatch, tmp_path):
 def test_scale_rejects_what_is_not_a_positive_number_or_auto(monkeypatch, tmp_path):
     for bad in ("banana", "0", "-1", "nan", "inf"):
         res = _run(monkeypatch, tmp_path, ["--oformat", "meme", f"--scale={bad}"])
-        assert res.exit_code == 2 and "auto" in res.output, bad
+        assert res.exit_code == 2 and "auto" in res.output and "seed" in res.output, bad
 
 
 def test_oformat_writes_to_stdout(monkeypatch, tmp_path):
@@ -162,7 +163,7 @@ def test_oformat_writes_to_stdout(monkeypatch, tmp_path):
 
 
 def test_scale_needs_a_frequency_format(monkeypatch, tmp_path):
-    for scale in ("2", "auto"):
+    for scale in ("2", "auto", "seed"):
         res = _run(monkeypatch, tmp_path, ["--scale", scale, "-o", str(tmp_path / "o.txt")])
         assert res.exit_code == 2 and "--oformat" in res.output
 
@@ -480,3 +481,159 @@ def test_fit_scale_samples_beyond_max_sequences(planted):
     everything = fit_scale(np.log(pfm), pos, neg, max_sequences=None)
     assert abs(capped / everything - 1) < .1
     assert capped == fit_scale(np.log(pfm), pos, neg, max_sequences=1000)   # seeded
+
+
+def _bits(pfm):
+    """Information content of a PFM, in bits."""
+    pfm = np.asarray(pfm, float)
+    return float((pfm * np.log2(np.clip(pfm, 1e-300, None) / .25)).sum())
+
+
+def _seed_19():
+    """Log PWM of 19 columns: 9 informative ones (5 to 13) between weak flanks."""
+    rng = np.random.default_rng(1714)
+    flank = lambda n: rng.dirichlet(np.full(4, 40.), n).T        # noqa: E731, nearly flat
+    core = rng.dirichlet(np.full(4, .3), 9).T + .01
+    return np.log(np.hstack([flank(5), core / core.sum(0), flank(5)]))
+
+
+def test_match_scale_gives_the_bits_of_the_seed_whatever_the_size_of_the_weights():
+    rng = np.random.default_rng(1714)
+    seed = np.log(rng.dirichlet(np.full(4, .5), 12).T + .01)
+    optimized = np.log(rng.dirichlet(np.full(4, .5), 12).T + .01)   # another motif
+    target = _bits(pwm_to_pfm(seed))
+    products = []
+    for size in (.1, 1., 10., 37.):
+        # arbitrary size, arbitrary constant per column
+        pwm = size * optimized + rng.normal(0, 3, (1, 12))
+        scale, details = match_scale(pwm, seed, return_details=True)
+        assert abs(_bits(pwm_to_pfm(pwm, scale)) - target) < 1e-6
+        assert abs(details["seed_bits"] - target) < 1e-9 and abs(details["bits"] - target) < 1e-6
+        assert not details["at_edge"] and not details["flat"] and details["width"] == 12
+        # the preferred base of each position is the optimized motif's, not the seed's
+        assert np.array_equal(pwm_to_pfm(pwm, scale).argmax(0), optimized.argmax(0))
+        products.append(scale * size)
+    assert max(products) / min(products) < 1 + 1e-6
+    # a seed matched to itself keeps its scale
+    assert abs(match_scale(seed, seed) - 1) < 1e-6
+    assert abs(match_scale(5 * seed, seed) - .2) < 1e-6
+
+
+def test_match_scale_counts_only_the_seed_columns_that_were_optimized():
+    seed = _seed_19()
+    whole = _bits(pwm_to_pfm(seed))
+    centre = _bits(pwm_to_pfm(seed[:, 5:14]))
+    assert np.array_equal(_resize(seed, 9), seed[:, 5:14]) and whole - centre > .05
+    rng = np.random.default_rng(7)
+    pwm = 30 * np.log(rng.dirichlet(np.full(4, .5), 9).T + .01)     # 9 columns, large weights
+    scale, details = match_scale(pwm, seed, return_details=True)
+    # the bits of the 9 columns kept, not those of the 19
+    assert abs(details["seed_bits"] - centre) < 1e-9
+    assert abs(_bits(pwm_to_pfm(pwm, scale)) - centre) < 1e-6
+    # every width follows the columns damo starts from
+    for width in (5, 7, 12, 19):
+        pwm = np.log(rng.dirichlet(np.full(4, .5), width).T + .01)
+        _, details = match_scale(pwm, seed, return_details=True)
+        assert abs(details["seed_bits"] - _bits(pwm_to_pfm(_resize(seed, width)))) < 1e-9
+        assert abs(details["bits"] - details["seed_bits"]) < 1e-6
+
+
+def test_match_scale_of_a_wider_motif_uses_the_whole_seed():
+    seed = _seed_19()[:, 5:14]
+    rng = np.random.default_rng(3)
+    pwm = np.log(rng.dirichlet(np.full(4, .5), 15).T + .01)         # 6 columns added to the seed
+    scale, details = match_scale(pwm, seed, return_details=True)
+    # padded columns are uniform: no bits
+    assert abs(details["seed_bits"] - _bits(pwm_to_pfm(seed))) < 1e-9
+    assert abs(_bits(pwm_to_pfm(pwm, scale)) - details["seed_bits"]) < 1e-6
+
+
+def test_match_scale_edge_cases():
+    seed = _seed_19()
+    # a flat PWM is uniform at every scale: 1, and no error
+    assert match_scale(np.zeros((4, 9)), seed) == 1.
+    scale, details = match_scale(np.full((4, 9), -1.386), seed, return_details=True)
+    assert scale == 1. and details["flat"] and not details["at_edge"]
+    # a seed without information in the columns kept has nothing to match
+    pwm = np.log(np.random.default_rng(1).dirichlet(np.full(4, .5), 6).T + .01)
+    with pytest.raises(NothingToMatch, match="no information in the 6 columns"):
+        match_scale(pwm, np.log(np.full((4, 6), .25)))
+    assert issubclass(NothingToMatch, ValueError)
+    # two tied best bases: at most 1 bit per column, the seed has more
+    tied = np.log(np.array([[.45, .45, .05, .05]] * 6).T)
+    sharp = np.log(np.array([[.97, .01, .01, .01]] * 6).T)
+    scale, details = match_scale(tied, sharp, return_details=True)
+    assert details["at_edge"] and np.isfinite(scale) and scale > 0
+    assert details["bits"] < 6.001 < details["seed_bits"]
+    assert np.all(np.isfinite(pwm_to_pfm(tied, scale)))
+    with pytest.raises(ValueError, match="not finite"):
+        match_scale(np.full((4, 6), np.nan), sharp)
+
+
+def test_scale_seed_matches_the_seed(monkeypatch, tmp_path):
+    seed = read_pwm(JASPAR)
+    pwm = seed * 20
+    out = tmp_path / "motif.meme"
+    res = _run(monkeypatch, tmp_path, ["--oformat", "meme", "--scale", "seed", "-o", str(out)], pwm)
+    assert res.exit_code == 0, res.output
+    # the seed, 20 times larger, comes back as the seed
+    np.testing.assert_allclose(_written(out), pwm_to_pfm(seed), atol=5e-4)
+    assert "Scale matched to the seed: 0.05 (" in res.output and "Fitted scale" not in res.output
+    assert f"{_bits(pwm_to_pfm(seed)):.2f} bits in the 15 seed columns" in res.output
+    # any case, and to stdout: the report comes after the motif
+    res = _run(monkeypatch, tmp_path, ["--oformat", "meme", "--scale", "SEED"], pwm)
+    assert res.exit_code == 0 and res.output.startswith("MEME version 4")
+    assert res.output.rstrip().splitlines()[-1].startswith("Scale matched to the seed: ")
+    # a narrower motif gets the bits of the seed columns it was cut to
+    rng = np.random.default_rng(1714)
+    narrow = 50 * np.log(rng.dirichlet(np.full(4, .5), 7).T + .01)
+    out7 = tmp_path / "motif7.meme"
+    res = _run(monkeypatch, tmp_path, ["--oformat", "meme", "--scale", "seed", "-o", str(out7)], narrow)
+    assert res.exit_code == 0, res.output
+    kept = _bits(pwm_to_pfm(_resize(seed, 7)))
+    assert kept < _bits(pwm_to_pfm(seed)) - 1
+    np.testing.assert_allclose(_written(out7), pwm_to_pfm(narrow, match_scale(narrow, seed)), atol=5e-4)
+    assert abs(_bits(_written(out7)) - kept) < .05
+    assert "in the 7 seed columns" in res.output
+    # the default is still the fitted scale
+    res = _run(monkeypatch, tmp_path, ["-d", "--oformat", "meme"], pwm)
+    assert "Fitted scale: " in res.output and "matched" not in res.output
+
+
+def test_scale_seed_falls_back_to_the_fit_for_a_flat_seed(monkeypatch, tmp_path):
+    flat = tmp_path / "flat.jaspar"
+    flat.write_text(">FLAT\tflat\n" + "".join(f"{b}  [ 100 100 100 100 ]\n" for b in "ACGT"))
+    pwm = np.log(np.array([[.7, .1, .1, .1], [.1, .2, .7, .1], [.1, .3, .1, .1], [.1, .4, .1, .7]]))
+    monkeypatch.setattr(cli, "damo", lambda *a, **k: pwm)
+    fa = os.path.join(ROOT, "examples", "positive_seqs.fa.gz")
+    out = tmp_path / "motif.meme"
+    res = CliRunner().invoke(cli.main, [fa, fa, str(flat), "-d", "--oformat", "meme",
+                                        "--scale", "seed", "-o", str(out)])
+    assert res.exit_code == 0, res.output
+    assert "no information in the 4 columns" in res.output and "Fitted scale: " in res.output
+    sequences = [str(r.seq) for r in read_sequences(fa, True)]
+    np.testing.assert_allclose(_written(out), pwm_to_pfm(pwm, fit_scale(pwm, sequences, sequences)), atol=5e-4)
+    # a flat PWM has nothing to match either, and is written as it is
+    monkeypatch.setattr(cli, "damo", lambda *a, **k: np.log(np.full((4, 3), .25)))
+    res = CliRunner().invoke(cli.main, [fa, fa, JASPAR, "--oformat", "meme", "--scale", "seed"])
+    assert res.exit_code == 0 and "nothing to match" in res.output
+
+
+def test_scale_seed_after_a_width_search(tmp_path):
+    with open(JASPAR) as f:
+        site = str(motifs.read(f, "jaspar").consensus)[3:12]
+    rng = random.Random(1714)
+    rand = lambda n: "".join(rng.choice("ACGT") for _ in range(n))  # noqa: E731
+    pos, neg, out = tmp_path / "pos.fa", tmp_path / "neg.fa", tmp_path / "motif.meme"
+    pos.write_text("".join(f">p{i}\n{rand(40)}{site}{rand(40)}\n" for i in range(100)))
+    neg.write_text("".join(f">n{i}\n{rand(89)}\n" for i in range(100)))
+    # the real optimization: the motif written has the bits of the seed columns of its width
+    res = CliRunner().invoke(cli.main, [str(pos), str(neg), JASPAR, "-i", "5", "-w", "5-7",
+                                        "--oformat", "meme", "--scale", "seed", "-o", str(out)])
+    assert res.exit_code == 0, res.output
+    written = _written(out)
+    width = written.shape[1]
+    assert width in (5, 6, 7, 15)
+    kept = _bits(pwm_to_pfm(_resize(read_pwm(JASPAR), width)))
+    assert abs(_bits(written) - kept) < .05
+    assert f"in the {width} seed columns" in res.output

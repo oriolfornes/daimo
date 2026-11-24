@@ -35,7 +35,7 @@ Options:
 - `-d, --debugging`: use only the first 1,000 sequences of each file.
 - `-w, --widths`: the widths to try, as a list in the style of `cut -f` (`8,10,12`, `5-19`, `5-8,12,15-`); default: the width of the seed (see [Motif width](#motif-width)).
 - `-m, --motif`: which motif to use when a MEME file has several, by name or by ID (e.g. `MA1419.1`). Not needed for single-motif files. MEME matrices are probabilities, so 1e-4 is added and the columns renormalized before taking the log, as DAMO does for the PFMs it builds.
-- `--scale`: with `--oformat jaspar` or `meme`, the factor applied to the PWM before converting it to frequencies: `auto` (default), which fits it to the sequences, or a positive number. See below.
+- `--scale`: with `--oformat jaspar` or `meme`, the factor applied to the PWM before converting it to frequencies: `auto` (default), which fits it to the sequences; `seed`, which gives the motif the information content of the seed; or a positive number. See below.
 
 The `AUC optimized from ... to ...` line is printed to stdout too, so use `-o` to keep the motif on its own.
 
@@ -63,7 +63,9 @@ By default (`--scale auto`) the scale is therefore fitted to the sequences: daim
 
 The figure shows what the scale does on the IRF4 example (first 1,000 sequences of each file, `-d`). The optimized PWM is the same in the four daimo logos (**a**): only the scale changes, and the motif goes from 7.7 bits at the fitted scale (0.036) to 28.5 bits, nearly one-hot, at scale 1. The fitted scale is the one at which the motif best explains the positive sequences (**b**); the sharper motifs at 0.1, 0.3 and 1 explain them worse, because real sites do not match the consensus that closely.
 
-`--scale` with a number uses that scale instead: above 1 sharpens the columns and below 1 flattens them. `--scale 0.1` gives the output of daimo 1.0.1, where it was the default. `--scale 1` is DiMO's unscaled conversion, which gives nearly one-hot columns because the optimized weights are large (about -290 to +32 on the IRF4 example). Information content is only comparable between motifs written with the fitted scale, or with the same number after the same number of iterations. The `pwm` format is not affected by the scale.
+`--scale seed` gives the optimized motif the sharpness of the motif it was started from: daimo takes the scale at which the motif has the same information content (bits) as the seed. Only the seed columns that were optimized count. With `-w`, a narrower motif starts from the most informative columns of the seed (see [Motif width](#motif-width)), so if the seed has 19 columns and daimo keeps 9 of them, the motif gets the bits of those 9 columns, not of the 19; columns added to the seed have no information, so a wider motif gets the bits of the whole seed. Which base each position prefers is not changed, only how sharp the columns are. The scale and the bits matched are reported on stderr after the motif is written. Use it when the motif should stay comparable to its seed, or when the positives differ only weakly from the negatives, where the fitted scale gives a flat motif. A seed with no information in those columns has nothing to match, and the scale is then fitted to the sequences as with `auto`.
+
+`--scale` with a number uses that scale instead: above 1 sharpens the columns and below 1 flattens them. `--scale 0.1` gives the output of daimo 1.0.1, where it was the default. `--scale 1` is DiMO's unscaled conversion, which gives nearly one-hot columns because the optimized weights are large (about -290 to +32 on the IRF4 example). Information content is only comparable between motifs written with the fitted scale, or with the same number after the same number of iterations; with `--scale seed` it is that of the seed by construction. The `pwm` format is not affected by the scale.
 
 ## Motif width
 
@@ -93,7 +95,7 @@ pwm = damo("positive_seqs.fa.gz", "negative_seqs.fa.gz", "motif.jaspar", iterati
 pwm = damo("positive_seqs.fa.gz", "negative_seqs.fa.gz", "motif.jaspar", widths="5-19")
 ```
 
-`pwm` is a NumPy array of shape (4, motif length), the log PWM with rows A, C, G and T. `widths` is a string like `cut -f` or a list of ints. `daimo.damo.pwm_to_pfm(pwm, scale)` converts a PWM to frequencies, and `daimo.damo.fit_scale(pwm, positive_seqs, negative_seqs)` fits that scale to sequences given as strings (what `--scale auto` does).
+`pwm` is a NumPy array of shape (4, motif length), the log PWM with rows A, C, G and T. `widths` is a string like `cut -f` or a list of ints. `daimo.damo.pwm_to_pfm(pwm, scale)` converts a PWM to frequencies, `daimo.damo.fit_scale(pwm, positive_seqs, negative_seqs)` fits that scale to sequences given as strings (what `--scale auto` does), and `daimo.damo.match_scale(pwm, seed_pwm)` returns the scale that matches the information content of the seed, with `seed_pwm` as `daimo.io.read_pwm` reads it (what `--scale seed` does).
 
 ## How daimo differs from DiMO and DAMO
 

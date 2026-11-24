@@ -4,8 +4,8 @@ import sys
 
 import click
 
-from daimo.damo import (DEFAULT_SCALE, _parse_width_ranges,
-                        damo, fit_scale, pwm_to_pfm)
+from daimo.damo import (DEFAULT_SCALE, NothingToMatch, _parse_width_ranges,
+                        damo, fit_scale, match_scale, pwm_to_pfm)
 from daimo.io import (open_file, read_motif, read_sequences, write_jaspar,
                        write_meme, write_pwm)
 
@@ -26,19 +26,19 @@ def _check_widths(value):
 
 
 class Scale(click.ParamType):
-    """A positive number, or "auto" (any case)."""
+    """A positive number, "auto" or "seed" (any case)."""
 
-    name = "number|auto"
+    name = "number|auto|seed"
 
     def convert(self, value, param, ctx):
-        if isinstance(value, str) and value.strip().lower() == "auto":
-            return "auto"
+        if isinstance(value, str) and value.strip().lower() in ("auto", "seed"):
+            return value.strip().lower()
         try:
             scale = float(value)
         except (TypeError, ValueError):
             scale = None
         if scale is None or not 0 < scale < float("inf"):
-            self.fail(f"{value!r} is not a positive number or 'auto'",
+            self.fail(f"{value!r} is not a positive number, 'auto' or 'seed'",
                       param, ctx)
 
         return scale
@@ -63,6 +63,37 @@ def _fit_scale(pwm, positive_seqs_file, negative_seqs_file, debugging):
     if details["at_edge"]:
         report += (" Warning: the fit ended at the edge of its search "
                    "interval, so this scale may not be the best one.")
+
+    return scale, report
+
+
+def _match_scale(pwm, seed_pwm, positive_seqs_file, negative_seqs_file,
+                 debugging):
+    """
+    Scale at which the PWM has the information content of the seed columns
+    that were optimized. A seed without information in them has nothing to
+    match: the scale is then fitted to the sequences, as with auto.
+
+    Returns:
+        Tuple (scale, report): the scale and a line that reports it.
+    """
+    try:
+        scale, details = match_scale(pwm, seed_pwm, return_details=True)
+    except NothingToMatch:
+        scale, report = _fit_scale(pwm, positive_seqs_file,
+                                   negative_seqs_file, debugging)
+        return scale, (f"The seed has no information in the {pwm.shape[1]} "
+                       "columns that were optimized, so the scale was fitted "
+                       "to the sequences instead. " + report)
+    if details["flat"]:
+        return scale, (f"Scale: {scale:g} (the PWM is flat, so there is "
+                       "nothing to match).")
+    report = (f"Scale matched to the seed: {scale:.4g} "
+              f"({details['seed_bits']:.2f} bits in the {details['width']} "
+              "seed columns that were optimized).")
+    if details["at_edge"]:
+        report += (f" Warning: the motif has {details['bits']:.2f} bits at "
+                   "this scale and cannot get closer to the seed.")
 
     return scale, report
 
@@ -124,8 +155,10 @@ def _fit_scale(pwm, positive_seqs_file, negative_seqs_file, debugging):
          "converting it to frequencies; above 1 sharpens the columns, "
          "below 1 flattens them. auto fits it to the positive sequences, "
          "so the sharpness of the motif does not depend on the size of the "
-         "weights; 0.1 gives the output of daimo 1.0.1; 1 is DiMO's "
-         "unscaled conversion and gives nearly one-hot columns.",
+         "weights; seed gives the motif the information content (bits) of "
+         "the seed columns that were optimized, so it is as sharp as the "
+         "motif it started from; 0.1 gives the output of daimo 1.0.1; 1 is "
+         "DiMO's unscaled conversion and gives nearly one-hot columns.",
     type=Scale(),
     default=DEFAULT_SCALE,
     show_default=True,
@@ -138,7 +171,8 @@ def main(**args):
     With --oformat jaspar or meme it is a motif of frequencies instead: the
     PWM weights are read as energies (kT) and converted with a Boltzmann
     distribution, as in DiMO, after scaling them. By default the scale is
-    fitted to the positive sequences (see --scale).
+    fitted to the positive sequences; --scale seed matches the sharpness of
+    the seed instead (see --scale).
     """
     ctx = click.get_current_context()
     scale_given = (ctx.get_parameter_source("scale")
@@ -157,11 +191,15 @@ def main(**args):
         def write(handle):
             write_pwm(pwm, handle)
     else:
-        name, _ = read_motif(args["seed_motif"], args["motif"])
+        name, seed_pwm = read_motif(args["seed_motif"], args["motif"])
         scale = args["scale"]
         if scale == "auto":
             scale, fit_report = _fit_scale(pwm, args["positive_seqs"],
                 args["negative_seqs"], args["debugging"])
+        elif scale == "seed":
+            scale, fit_report = _match_scale(pwm, seed_pwm,
+                args["positive_seqs"], args["negative_seqs"],
+                args["debugging"])
         pfm = pwm_to_pfm(pwm, scale)
         writer = write_jaspar if args["oformat"] == "jaspar" else write_meme
 

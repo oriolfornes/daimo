@@ -31,8 +31,10 @@ VALIDATION_FRACTION = 0.2
 # PWM only has to rank positives above negatives, and a ranking does not change
 # when every weight is multiplied by the same number: the size of the weights is
 # arbitrary, and it keeps growing while daimo runs. So no fixed scale is right.
-# "auto" fits it to the sequences (see fit_scale). A number is used as it is:
-# 0.1 was the default up to 1.0.1, and 1 is DiMO's unscaled conversion.
+# "auto" fits it to the sequences (see fit_scale). "seed" gives the motif the
+# information content of the seed columns that were optimized (see
+# match_scale). A number is used as it is: 0.1 was the default up to 1.0.1, and
+# 1 is DiMO's unscaled conversion.
 DEFAULT_SCALE = "auto"
 
 # fit_scale. The search interval is in units of "nats between the best and the
@@ -45,6 +47,13 @@ GRID_POINTS = 60
 MAX_SEQUENCES = 10000      # the fit does not need more: a seeded sample is used beyond this
 SEED = 1714
 GOLDEN = (np.sqrt(5) - 1) / 2
+
+# match_scale. A seed with less information than this in the columns that were
+# optimized has nothing to match. The search interval is in the units of
+# SPREAD_RANGE, but wider: any information content has to be within reach, not
+# only the scales that describe real sites.
+MIN_SEED_BITS = 0.01
+MATCH_RANGE = (1e-4, 1e4)
 
 LEARNING_RATES = [1.0, 0.55, 0.1]
 
@@ -566,6 +575,103 @@ def fit_scale(pwm, positive_seqs, negative_seqs=None,
     return scale, dict(fraction_with_site=float(1 / (1 + np.exp(-logit))),
                        log_likelihood=float(ll), at_edge=bool(at_edge),
                        sequences=int(len(raw)), spread=spread)
+
+
+class NothingToMatch(ValueError):
+    """The seed has no information in the columns that were optimized."""
+
+
+def _information(pfm):
+    """Information content of each column of a PFM, in bits."""
+    pfm = np.asarray(pfm, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        terms = np.where(pfm > 0, pfm * np.log2(pfm / 0.25), 0.0)
+
+    return terms.sum(axis=0)
+
+
+def match_scale(pwm, seed_pwm, return_details=False):
+    """
+    Scale at which softmax(scale * pwm) has the information content of the seed.
+
+    The optimized motif gets the sharpness of the motif it was started from.
+    Only the seed columns that were optimized count: the seed is cut or padded
+    to the width of the PWM as `damo` does it (see _resize). If the seed has 19
+    columns and the optimized motif the 9 most informative ones, the scale is
+    the one at which the motif has as many bits as those 9 seed columns; columns
+    added to a seed have no information, so a wider motif gets the bits of the
+    whole seed. Information content grows with the scale, so there is one
+    answer. Which base each position prefers does not change.
+
+    Args:
+        pwm: Log PWM of shape (4, motif length), rows A, C, G and T (what
+            `damo` returns).
+        seed_pwm: Log PWM of the seed, of any width (what `read_pwm` returns
+            for the motif `damo` was given).
+        return_details: Also return a dict: seed_bits (information content of
+            the seed columns), bits (of the motif at the scale returned),
+            width, at_edge (the motif cannot have the information content of
+            the seed, and this is the closest scale; with tied bases a column
+            cannot reach 2 bits), flat (the PWM is flat) and spread.
+
+    Returns:
+        The scale (float), 1.0 for a flat PWM, which is uniform at every
+        scale. Use it as `pwm_to_pfm(pwm, scale)`.
+
+    Raises:
+        NothingToMatch: The seed columns have less than 0.01 bits in total.
+    """
+    pwm = np.asarray(pwm, dtype=np.float64)
+    seed_pwm = np.asarray(seed_pwm, dtype=np.float64)
+    if not (np.all(np.isfinite(pwm)) and np.all(np.isfinite(seed_pwm))):
+        raise ValueError("the PWM or the seed has values that are not finite")
+    width = pwm.shape[1]
+
+    # The seed columns that were optimized
+    seed_bits = float(_information(pwm_to_pfm(_resize(seed_pwm, width))).sum())
+
+    # A constant per column changes nothing
+    weights = pwm - pwm.mean(axis=0, keepdims=True)
+    spread = float((weights.max(axis=0) - weights.min(axis=0)).mean())
+
+    def bits(scale):
+        return float(_information(pwm_to_pfm(weights, scale)).sum())
+
+    # A flat PWM is uniform at every scale
+    if spread <= 0:
+        if return_details:
+            return 1.0, dict(seed_bits=seed_bits, bits=0.0, width=width,
+                             at_edge=False, flat=True, spread=0.0)
+        return 1.0
+
+    if seed_bits < MIN_SEED_BITS:
+        raise NothingToMatch(
+            f"the seed has no information in the {width} columns that were "
+            f"optimized ({seed_bits:.2g} bits), so there is no sharpness to "
+            "match")
+
+    # Bisection on the log of the scale: the information content grows with it
+    lo, hi = (float(np.log(edge / spread)) for edge in MATCH_RANGE)
+    at_edge = True
+    if seed_bits <= bits(np.exp(lo)):
+        log_scale = lo
+    elif seed_bits >= bits(np.exp(hi)):
+        log_scale = hi
+    else:
+        at_edge = False
+        for _ in range(100):
+            log_scale = (lo + hi) / 2
+            if bits(np.exp(log_scale)) < seed_bits:
+                lo = log_scale
+            else:
+                hi = log_scale
+        log_scale = (lo + hi) / 2
+    scale = float(np.exp(log_scale))
+    if not return_details:
+        return scale
+
+    return scale, dict(seed_bits=seed_bits, bits=bits(scale), width=width,
+                       at_edge=at_edge, flat=False, spread=spread)
 
 
 def _get_pwm_model(pwm, sequence_length, device="cpu"):
